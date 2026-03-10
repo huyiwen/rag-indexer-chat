@@ -187,6 +187,91 @@ def extract_keywords(text: str, num_keywords: int = 5) -> list:
     most_common = word_counts.most_common(num_keywords)
     return [word for word, _ in most_common]
 
+
+def index_wechat_docs(
+    docs: List[Document],
+    sqlite_path: Path,
+    *,
+    model: str = "all-MiniLM-L6-v2",
+    chunk_size: int = 512,
+    chunk_overlap: int = 100,
+) -> None:
+    """
+    Index a list of Documents (e.g. WeChat messages) into the existing SQLite backend.
+
+    This reuses the same StorageContext / VectorStoreIndex setup as the file‑system
+    indexer but skips any on‑disk file scanning or cache handling.
+    """
+    if not docs:
+        log.info("No documents provided for indexing; skipping.")
+        return
+
+    sqlite_path = sqlite_path.expanduser().resolve()
+    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    if not sqlite_path.exists():
+        sqlite_path.touch()
+
+    parser = SimpleNodeParser(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    configure_settings(model, parser)
+
+    kvstore = SQLiteKVStore(str(sqlite_path))
+    kvstore["index_runs"] = kvstore.get("index_runs", 0) + 1
+    kvstore["last_index_run"] = time.time()
+
+    vector_store = SQLiteVectorStoreNoPersist(str(sqlite_path))
+    with SQLiteDocStore(str(sqlite_path)) as docstore:
+        storage_context = StorageContext.from_defaults(
+            docstore=docstore,
+            index_store=SQLiteIndexStore(str(sqlite_path)),
+            vector_store=vector_store,
+            graph_store=SQLiteGraphStore(str(sqlite_path)),
+            persist_dir=None,
+        )
+        storage_context.kvstore = kvstore
+
+        try:
+            index = VectorStoreIndex.from_vector_store(
+                vector_store=vector_store,
+                storage_context=storage_context,
+            )
+            log.info("Loaded existing index from vector store for WeChat docs.")
+        except Exception as e:
+            log.warning(f"Index not found or load failed for WeChat docs: {e}")
+            log.warning("Creating new index with provided WeChat documents.")
+            index = VectorStoreIndex.from_documents(
+                docs,
+                storage_context=storage_context,
+                store_text=True,
+            )
+
+        # Always add documents to the docstore
+        docstore.add_documents(docs)
+        storage_context.index_store.add_index_struct(index.index_struct)
+        storage_context.index_store.persist()
+
+        # Insert as nodes if we successfully parsed them
+        new_nodes = parser.get_nodes_from_documents(docs)
+        if new_nodes:
+            index.insert_nodes(new_nodes)
+            log.info(f"Inserted {len(new_nodes)} WeChat nodes.")
+
+        all_docs = docstore.get_all_docs()
+        kvstore["total_docs"] = len(all_docs)
+
+        total_tokens = sum(
+            len(doc.text.split()) for doc in all_docs.values()
+            if isinstance(doc, Document) and doc.text
+        )
+        kvstore["tokens_indexed"] = total_tokens
+
+        if not docstore.check_index_consistency():
+            log.error("Index inconsistency detected after WeChat indexing!")
+            return
+
+        docstore.persist()
+        storage_context.index_store.persist()
+        storage_context.graph_store.persist()
+
 def main() -> None:
     """
     Entry point for the RAG Indexer.
