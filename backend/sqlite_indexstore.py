@@ -253,6 +253,24 @@ class SQLiteIndexStore(BaseIndexStore):
                 "DELETE FROM indexstore WHERE index_id = ?", (index_id,)
             )
 
+    # --- Async wrappers required by BaseIndexStore (for newer llama_index versions) ---
+
+    async def aget_index_struct(self, index_id: str) -> Optional[IndexStruct]:
+        """Async wrapper for get_index_struct."""
+        return self.get_index_struct(index_id)
+
+    async def async_add_index_struct(self, index_struct: IndexStruct, **kwargs) -> None:
+        """Async wrapper for add_index_struct."""
+        self.add_index_struct(index_struct, **kwargs)
+
+    async def async_index_structs(self) -> List[IndexStruct]:
+        """Async wrapper for index_structs."""
+        return self.index_structs()
+
+    async def adelete_index_struct(self, index_id: str) -> None:
+        """Async wrapper for delete_index_struct."""
+        self.delete_index_struct(index_id)
+
     def persist(self, persist_path: Optional[str] = None, fs: Optional[Any] = None):
         log.debug("Persisting indexstore to SQLite (commit only)")
         self._conn.commit()

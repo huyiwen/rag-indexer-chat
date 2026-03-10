@@ -1,58 +1,55 @@
 # indexer.py
 # Retrieve-Augmented Generator (RAG) Indexer
 
+import argparse
+import json
+import logging
+import os
+import re
+import shutil
+import signal
+import sqlite3
 import sys
 import time
-import os
-import json
-import signal
-import logging
-import argparse
-import shutil
-import sqlite3
-from textwrap import dedent
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass
 from collections import Counter
-import re
+from dataclasses import dataclass
+from pathlib import Path
+from textwrap import dedent
+from typing import Any, Dict, List, Optional, Tuple
 
-from llama_index.core import (
-    Document,
-    Settings,
-    StorageContext,
-    VectorStoreIndex,
-)
-
+from llama_index.core import (Document, Settings, StorageContext,
+                              VectorStoreIndex)
 # Combine
 from llama_index.core.node_parser import SimpleNodeParser
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.ollama import Ollama
+
 try:
     from llama_index.core.indices.base import IndexNotFoundError
 except ImportError:
     # fallback for older versions
     IndexNotFoundError = Exception
 
-from backend.sqlite_kvstore import SQLiteKVStore
-from backend.sqlite_docstore import SQLiteDocStore
-from backend.sqlite_indexstore import SQLiteIndexStore
-from backend.sqlite_vectorstore import SQLiteVectorStore
-from backend.sqlite_graphstore import SQLiteGraphStore
-
 # --- LlamaIndex Global Settings ---
 from llama_index.core.settings import Settings
+
+from backend.sqlite_docstore import SQLiteDocStore
+from backend.sqlite_graphstore import SQLiteGraphStore
+from backend.sqlite_indexstore import SQLiteIndexStore
+from backend.sqlite_kvstore import SQLiteKVStore
+from backend.sqlite_vectorstore import SQLiteVectorStore
+
 
 @dataclass(frozen=True)
 class Config:
     index_dir   : Path = Path("./index")
-    sqlite_path : Path = index_dir / "sqlite.db"
+    sqlite_path : Path = index_dir / "sqlite.db"  # default, can be overridden by CLI
     cache_path  : Path = index_dir / ".index_cache.json"
     supported_extensions: frozenset = frozenset({
         ".py", ".sh", ".md", ".txt", ".yaml", ".yml", ".json",
         ".html", ".js", ".ts", ".css", ".java", ".cpp", ".c", ".go"
     })
-    
+
 def configure_settings(model: str, parser: SimpleNodeParser) -> None:
     """Configure LLM, embedding, and node parser settings."""
     Settings.store_text = True
@@ -113,6 +110,12 @@ def parse_args() -> argparse.Namespace:
     # — File system
     parser.add_argument("--dir", default=".",
                         metavar="PATH", help="Root directory to index")
+
+    # — SQLite database
+    parser.add_argument("--sqlite",
+                        default=str(Config.sqlite_path),
+                        metavar="SQLITE_DB",
+                        help="Path to the SQLite database used for docstore/vectorstore/index metadata")
 
     # — House‑keeping flags
     group = parser.add_mutually_exclusive_group()
@@ -194,6 +197,9 @@ def main() -> None:
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
     args = parse_args()
 
+    # Resolve SQLite path (can point to your own DB file)
+    sqlite_path = Path(args.sqlite).expanduser().resolve()
+
     parser = SimpleNodeParser(chunk_size=args.chunk_size, chunk_overlap=args.chunk_overlap)
 
     configure_settings(args.model, parser)
@@ -227,9 +233,15 @@ def main() -> None:
 
     log.info(f"Embedding model: {args.model}")
     log.info(f"Index directory: {Config.index_dir}")
+    log.info(f"SQLite path   : {sqlite_path}")
     log.info(f"Chunking with size={args.chunk_size} overlap={args.chunk_overlap}")
 
     Config.index_dir.mkdir(parents=True, exist_ok=True)
+
+    # Ensure the SQLite file exists if we're creating a fresh index DB
+    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    if not sqlite_path.exists():
+        sqlite_path.touch()
 
     # Load file cache
     file_cache = load_file_cache(Config.cache_path)
@@ -244,19 +256,19 @@ def main() -> None:
         log.info(f"Scanned {len(updated_cache)} files")
         new_nodes = parser.get_nodes_from_documents(new_docs)
 
-        kvstore = SQLiteKVStore(str(Config.sqlite_path))
+        kvstore = SQLiteKVStore(str(sqlite_path))
         kvstore["total_files_seen"] = len(updated_cache)
         kvstore["index_runs"] = kvstore.get("index_runs", 0) + 1
         kvstore["last_index_run"] = time.time()
         log.info(f"Last index run: {time.ctime(kvstore['last_index_run'])}")
 
-        vector_store = SQLiteVectorStoreNoPersist(str(Config.sqlite_path))
-        with SQLiteDocStore(str(Config.sqlite_path)) as docstore:
+        vector_store = SQLiteVectorStoreNoPersist(str(sqlite_path))
+        with SQLiteDocStore(str(sqlite_path)) as docstore:
             storage_context = StorageContext.from_defaults(
                 docstore=docstore,
-                index_store=SQLiteIndexStore(str(Config.sqlite_path)),
+                index_store=SQLiteIndexStore(str(sqlite_path)),
                 vector_store=vector_store,
-                graph_store=SQLiteGraphStore(str(Config.sqlite_path)),
+                graph_store=SQLiteGraphStore(str(sqlite_path)),
                 persist_dir=None,
             )
             storage_context.kvstore = kvstore
