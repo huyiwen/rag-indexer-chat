@@ -1,39 +1,40 @@
 # Retrieve-Augmented Generator (RAG) Chat Interface
 
 # Standard Library
+import argparse
+import json
+import logging
+import re
+import signal
 import sys
 import time
-import json
-import signal
-import logging
-import argparse
-import re
-from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Any
 from difflib import get_close_matches
+from pathlib import Path
 from textwrap import shorten
+from typing import Any, Dict, List, Optional, Tuple
 
+from llama_index.core import Settings, StorageContext, VectorStoreIndex
+from llama_index.core.retrievers import VectorIndexRetriever
+from llama_index.core.schema import Node
+from llama_index.core.vector_stores.types import (MetadataFilter,
+                                                  MetadataFilters,
+                                                  VectorStoreQuery,
+                                                  VectorStoreQueryMode)
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.llms.ollama import Ollama
 # Third-party
 from rich.console import Console
-from rich.prompt import Prompt
-from rich.panel import Panel
-from rich.markdown import Markdown
 from rich.logging import RichHandler
-from llama_index.core import StorageContext, Settings, VectorStoreIndex
-from llama_index.llms.ollama import Ollama
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.core.retrievers import VectorIndexRetriever
-from llama_index.core.vector_stores.types import VectorStoreQuery, VectorStoreQueryMode
-from llama_index.core.schema import Node
-from llama_index.core.vector_stores.types import MetadataFilter, MetadataFilters
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.prompt import Prompt
 from transformers import GPT2TokenizerFast
 
 # Local SQLite Storage
 from backend.sqlite_docstore import SQLiteDocStore
 from backend.sqlite_indexstore import SQLiteIndexStore
 from backend.sqlite_vectorstore import SQLiteVectorStore
-
 
 console = Console()
 log = logging.getLogger(__name__)
@@ -51,33 +52,79 @@ class HybridRetriever(VectorIndexRetriever):
     """
     Custom retriever supporting both keyword filter and embedding-based search.
     """
+    def __init__(self, *args: Any, node_lookup: Optional[Dict[str, Node]] = None, all_nodes: Optional[List[Node]] = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._node_lookup = node_lookup or {}
+        self._all_nodes = all_nodes or []
+
+    def _lexical_fallback(self, query_str: str) -> List[Node]:
+        query = query_str.strip().lower()
+        if not query:
+            return []
+
+        query_terms = [query]
+        if " " in query:
+            query_terms.extend(part for part in query.split() if part)
+
+        scored_nodes: List[Tuple[int, Node]] = []
+        for node in self._all_nodes:
+            text = getattr(node, "text", "") or ""
+            metadata = getattr(node, "metadata", {}) or {}
+            corpus = " ".join(
+                [
+                    text.lower(),
+                    " ".join(str(v).lower() for v in metadata.values()),
+                ]
+            )
+            score = sum(term in corpus for term in query_terms)
+            if score > 0:
+                scored_nodes.append((score, node))
+
+        scored_nodes.sort(key=lambda item: item[0], reverse=True)
+        return [node for _, node in scored_nodes[: self._similarity_top_k]]
+
     def retrieve(self, query_str: str) -> List[Node]:
         log.debug(f"HybridRetriever running query: '{query_str}'")
         log.debug(f"Filters used: {[k for k in query_str.lower().split()]}")
 
-        embedding = Settings.embed_model.get_text_embedding(query_str)
+        embedding = Settings.embed_model.get_query_embedding(query_str)
+        vector_store = self._index.vector_store
 
-        query = VectorStoreQuery(
-            query_str=query_str,
-            query_embedding=embedding,
-            mode=VectorStoreQueryMode.DEFAULT,
-            #filters=MetadataFilters(filters=[MetadataFilter(key="keywords", value=k) for k in query_str.lower().split()]),
-        )
-        results = self._index.vector_store.query(query)
-        log.debug(f"Scores: {[r.score for r in results.nodes or []]}")
-
-        if results.nodes and max(r.score for r in results.nodes) < 0.3:
-            log.warning("All retrieved scores are low. Consider tweaking your index or query.")
-
-        if not results.nodes:
-            log.debug("Trying fallback: pure embedding query")
-            results = self._index.vector_store.query(
-                VectorStoreQuery(query_str=query_str,
+        nodes: List[Node] = []
+        if hasattr(vector_store, "hybrid_search"):
+            raw_results = vector_store.hybrid_search(
                 query_embedding=embedding,
-                mode=VectorStoreQueryMode.DEFAULT)
-           )
+                query_keywords=query_str,
+                top_k=self._similarity_top_k,
+            )
+            nodes = [
+                self._node_lookup[result["vector_id"]]
+                for result in raw_results
+                if result["vector_id"] in self._node_lookup
+            ]
+            log.debug(
+                "Hybrid search ids: %s",
+                [result["vector_id"] for result in raw_results],
+            )
+        else:
+            results = vector_store.query(
+                VectorStoreQuery(
+                    query_str=query_str,
+                    query_embedding=embedding,
+                    mode=VectorStoreQueryMode.HYBRID,
+                    similarity_top_k=self._similarity_top_k,
+                )
+            )
+            if results.nodes:
+                nodes = list(results.nodes)
+            elif results.ids:
+                nodes = [self._node_lookup[node_id] for node_id in results.ids if node_id in self._node_lookup]
 
-        return [self._node_postprocess(r) for r in results.nodes or []]
+        if not nodes:
+            log.debug("Vector retrieval missed; trying lexical fallback")
+            nodes = self._lexical_fallback(query_str)
+
+        return nodes
 
 def build_arg_parser() -> argparse.ArgumentParser:
     return argparse.ArgumentParser(
@@ -92,8 +139,11 @@ def parse_args() -> argparse.Namespace:
     # — Retrieval / generation
     parser.add_argument("--llm",   default="mistral",
                         help="LLM served by Ollama for final answers")
-    parser.add_argument("--embed", default="all-MiniLM-L6-v2",
-                        help="Sentence‑transformer model for embeddings")
+    parser.add_argument(
+        "--embed",
+        default="Qwen/Qwen3-Embedding-4B",
+        help="Sentence‑transformer model for embeddings",
+    )
     parser.add_argument("--top-k", type=int, default=10,
                         metavar="N", help="How many chunks to retrieve per query")
 
@@ -137,12 +187,36 @@ def build_metadata(args: argparse.Namespace, history: List[Tuple[str, str]]) -> 
         "history_len": len(history),
     }
 
-def load_storage() -> Tuple[StorageContext, Any]:
+def load_storage(sqlite_path: Optional[Path] = None) -> Tuple[StorageContext, Any]:
+    target_sqlite = sqlite_path or Config.sqlite_path
     storage = StorageContext.from_defaults(
-        docstore=SQLiteDocStore(str(Config.sqlite_path)),
-        index_store=SQLiteIndexStore(str(Config.sqlite_path)),
-        vector_store=SQLiteVectorStore(str(Config.sqlite_path)),
+        docstore=SQLiteDocStore(str(target_sqlite)),
+        index_store=SQLiteIndexStore(str(target_sqlite)),
+        vector_store=SQLiteVectorStore(str(target_sqlite)),
     )
+    all_docs = list(storage.docstore.get_all_docs().values())
+    vector_count = storage.vector_store.count() if hasattr(storage.vector_store, "count") else 0
+
+    # Self-heal old/broken caches that have docstore content but no vectors.
+    if all_docs and vector_count == 0:
+        log.warning(
+            "Vector store is empty but docstore has %d docs; rebuilding embeddings for %s",
+            len(all_docs),
+            target_sqlite,
+        )
+        if hasattr(storage.vector_store, "delete_all"):
+            storage.vector_store.delete_all()
+        storage.index_store.delete_all()
+        index = VectorStoreIndex.from_documents(
+            all_docs,
+            storage_context=storage,
+            store_text=True,
+            show_progress=True,
+        )
+        storage.index_store.add_index_struct(index.index_struct)
+        storage.index_store.persist()
+        storage.vector_store.persist()
+        return storage, index
 
     index_structs = storage.index_store.get_index_structs_dict()
     if not index_structs:
@@ -156,7 +230,34 @@ def load_storage() -> Tuple[StorageContext, Any]:
         return storage, index
 
     index_id = next(iter(index_structs))
-    return storage, storage.index_store.get_index(index_id)
+    index_struct = storage.index_store.get_index_struct(index_id)
+    if index_struct is None:
+        raise ValueError(f"Failed to load index struct {index_id}")
+    index = VectorStoreIndex(
+        nodes=[],
+        index_struct=index_struct,
+        storage_context=storage,
+    )
+    return storage, index
+
+
+def prepare_chat_state(sqlite_path: Path, top_k: int) -> Tuple[StorageContext, Any, List[Node], set[str], HybridRetriever]:
+    """Load index and build retriever state for a specific SQLite index file."""
+    storage, index = load_storage(sqlite_path)
+    indexed_nodes = list(storage.docstore.get_all_docs().values())
+    filenames = {Path(node.metadata.get("filename", "unknown")).name for node in indexed_nodes}
+    node_lookup = {}
+    for node in indexed_nodes:
+        node_id = getattr(node, "node_id", None) or getattr(node, "id_", None) or getattr(node, "doc_id", None)
+        if node_id:
+            node_lookup[node_id] = node
+    retriever = HybridRetriever(
+        index=index,
+        similarity_top_k=top_k,
+        node_lookup=node_lookup,
+        all_nodes=indexed_nodes,
+    )
+    return storage, index, indexed_nodes, filenames, retriever
 
 def filename_in_query(q: str, files: set[str]) -> str | None:
     for token in FILENAME_RE.findall(q):
@@ -295,7 +396,7 @@ def chat_loop(index: Any, retriever: HybridRetriever, system_prompt: str, args: 
             elapsed = time.perf_counter() - start
             log.debug(f"Retrieved {len(nodes)} nodes in {elapsed:.2f}s")
 
-            retrieved_filenames = extract_filenames(nodes)            
+            retrieved_filenames = extract_filenames(nodes)
             if log.level == logging.DEBUG:
                 console.print(
                     f"[green]Retrieved {len(nodes)} chunk(s)"
@@ -378,7 +479,7 @@ def main():
     """
     Entry point for RAG Chat CLI.
 
-    Parses command-line arguments, configures settings, 
+    Parses command-line arguments, configures settings,
     loads index storage, and starts the interactive chat loop.
     """
     args = parse_args()

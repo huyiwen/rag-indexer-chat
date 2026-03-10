@@ -100,8 +100,11 @@ def parse_args() -> argparse.Namespace:
     )
 
     # — Embedding / chunking
-    parser.add_argument("--model", default="all-MiniLM-L6-v2",
-                        help="Sentence‑transformer model used for embeddings")
+    parser.add_argument(
+        "--model",
+        default="Qwen/Qwen3-Embedding-4B",
+        help="Sentence‑transformer model used for embeddings",
+    )
     parser.add_argument("--chunk-size", type=int, default=512,
                         metavar="TOKENS", help="Chunk size passed to node parser")
     parser.add_argument("--chunk-overlap", type=int, default=100,
@@ -186,6 +189,72 @@ def extract_keywords(text: str, num_keywords: int = 5) -> list:
     word_counts = Counter(words)
     most_common = word_counts.most_common(num_keywords)
     return [word for word, _ in most_common]
+
+
+def index_wechat_docs(
+    docs: List[Document],
+    sqlite_path: Path,
+) -> None:
+    """
+    Index an in-memory list of WeChat Documents into the existing SQLite backend.
+
+    This mirrors the core logic from main() but skips filesystem scanning.
+    """
+    kvstore = SQLiteKVStore(str(sqlite_path))
+    vector_store = SQLiteVectorStoreNoPersist(str(sqlite_path))
+    nodes = Settings.node_parser.get_nodes_from_documents(docs) if docs else []
+
+    with SQLiteDocStore(str(sqlite_path)) as docstore:
+        storage_context = StorageContext.from_defaults(
+            docstore=docstore,
+            index_store=SQLiteIndexStore(str(sqlite_path)),
+            vector_store=vector_store,
+            graph_store=SQLiteGraphStore(str(sqlite_path)),
+            persist_dir=None,
+        )
+        storage_context.kvstore = kvstore
+
+        loaded_existing = False
+        try:
+            index = VectorStoreIndex.from_vector_store(
+                vector_store=vector_store,
+                storage_context=storage_context,
+                show_progress=True,
+            )
+            loaded_existing = True
+            log.info("Loaded existing index from vector store for WeChat docs.")
+        except Exception as e:
+            log.warning(f"WeChat index not found or load failed: {e}")
+            log.warning("Creating new index with WeChat docs.")
+            index = VectorStoreIndex.from_documents(
+                docs,
+                storage_context=storage_context,
+                store_text=True,
+                show_progress=True,
+            )
+
+        if loaded_existing and nodes:
+            index.insert_nodes(nodes, show_progress=True)
+
+        # Persist docs and index structures
+        docstore.add_documents(docs)
+        storage_context.index_store.add_index_struct(index.index_struct)
+        storage_context.index_store.persist()
+        storage_context.graph_store.persist()
+
+        all_docs = docstore.get_all_docs()
+        kvstore["total_docs"] = len(all_docs)
+
+        total_tokens = sum(
+            len(doc.text.split()) for doc in all_docs.values()
+            if isinstance(doc, Document) and doc.text
+        )
+        kvstore["tokens_indexed"] = total_tokens
+
+        log.info(
+            f"WeChat indexing complete: {len(docs)} new docs, "
+            f"{len(all_docs)} total docs, ~{total_tokens} tokens."
+        )
 
 def main() -> None:
     """

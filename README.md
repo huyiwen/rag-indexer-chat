@@ -75,7 +75,7 @@ Build or update a local SQLite‑backed index for RAG search.
 
 options:
   -h, --help            show this help message and exit
-  --model MODEL         Sentence‑transformer model used for embeddings (default: all-MiniLM-L6-v2)
+  --model MODEL         Sentence‑transformer model used for embeddings (default: Qwen/Qwen3-Embedding-4B)
   --chunk-size TOKENS   Chunk size passed to node parser (default: 512)
   --chunk-overlap TOKENS
                         Overlap between consecutive chunks (default: 100)
@@ -97,7 +97,7 @@ Interactive RAG chat over your local index
 options:
   -h, --help            show this help message and exit
   --llm LLM             LLM served by Ollama for final answers (default: mistral)
-  --embed EMBED         Sentence‑transformer model for embeddings (default: all-MiniLM-L6-v2)
+  --embed EMBED         Sentence‑transformer model for embeddings (default: Qwen/Qwen3-Embedding-4B)
   --top-k N             How many chunks to retrieve per query (default: 10)
   --chatlog CHATLOG     Path to save chat log JSON (auto‑generated if omitted) (default: None)
   --history-limit TURNS
@@ -120,7 +120,7 @@ options:
 ## Configuration
 
 - Modify `Config` in `indexer.py` and `chat.py` to customize paths and supported file types.
-- Embedding model defaults to `all-MiniLM-L6-v2`.
+- Embedding model defaults to `Qwen/Qwen3-Embedding-4B`.
 - LLM defaults to `Ollama` with `mistral` (you must have Ollama installed and running).
 
 ---

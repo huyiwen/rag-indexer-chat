@@ -49,15 +49,15 @@ class SQLiteVectorStore:
             )
 
     def query(self, query: VectorStoreQuery) -> VectorStoreQueryResult:
-        if query.mode == VectorStoreQueryMode.HYBRID:
+        if query.mode in {VectorStoreQueryMode.HYBRID, VectorStoreQueryMode.DEFAULT}:
             results = self.hybrid_search(
                 query_embedding=query.query_embedding,
-                query_keywords=query.filters.get("keywords") if query.filters else None,
+                query_keywords=query.query_str,
                 top_k=query.similarity_top_k or 5,
                 alpha=self.alpha, beta=self.beta
             )
             return VectorStoreQueryResult(
-                nodes=[r["vector_id"] for r in results],
+                ids=[r["vector_id"] for r in results],
                 similarities=[r["hybrid_score"] for r in results],
             )
         else:
@@ -140,6 +140,16 @@ class SQLiteVectorStore:
 
         return result
 
+    def count(self) -> int:
+        """Return number of stored vectors."""
+        row = self._conn.execute("SELECT COUNT(*) FROM vectorstore").fetchone()
+        return int(row[0]) if row else 0
+
+    def delete_all(self) -> None:
+        """Delete all stored vectors."""
+        with self._conn:
+            self._conn.execute("DELETE FROM vectorstore")
+
     def hybrid_search(
         self,
         query_embedding: List[float],
@@ -160,13 +170,13 @@ class SQLiteVectorStore:
             "SELECT vector_id, embedding_json, metadata_json FROM vectorstore"
         ).fetchall()
         log.debug(f"Applying vector_id filter: {vector_id_filters}")
-        
+
         keywords = []
         if isinstance(query_keywords, str):
             keywords = query_keywords.lower().split()
         elif isinstance(query_keywords, list):
             keywords = [kw.lower() for kw in query_keywords]
-        
+
         log.debug(f"Running hybrid query with keywords={keywords} top_k={top_k}")
 
         results = []
@@ -232,4 +242,3 @@ class SQLiteVectorStore:
         if self._conn:
             self._conn.close()
             self._conn = None
-            
